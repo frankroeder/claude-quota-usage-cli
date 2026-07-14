@@ -66,7 +66,11 @@ Weekly (7d): 78.2% remaining (resets in 3d 14h)
   [███████████████████████████████░░░░░░░░░] 78.2%
 ```
 
-Credentials loaded from `~/.claude/.credentials.json` or macOS Keychain.
+Auth (same as Claude Code / sketchybar helper):
+1. Keychain service `Claude Code-credentials` via `security find-generic-password -w`
+2. Else `~/.claude/.credentials.json`
+
+Token fields: `claudeAiOauth.accessToken` or `access_token`.
 
 ## License
 

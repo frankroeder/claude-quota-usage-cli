@@ -12,10 +12,24 @@ struct ClaudeQuota {
     let resetText: String?
   }
 
+  /// Entry from API `limits` array (session, weekly_all, weekly_scoped/Fable, …)
+  struct Limit {
+    let kind: String
+    let group: String?
+    let percentUsed: Double
+    let percentRemaining: Double
+    let severity: String?
+    let resetAt: Date?
+    let resetText: String?
+    let modelName: String?
+    let isActive: Bool?
+  }
+
   let session: Window?  // 5-hour window
   let weekly: Window?   // 7-day window
   let weeklyOpus: Window?  // 7-day Opus
   let weeklySonnet: Window?  // 7-day Sonnet
+  let limits: [Limit]
   let accountEmail: String?
   let plan: String?
   let extraUsage: ExtraUsage?
@@ -73,91 +87,84 @@ final class ClaudeOAuthFetcher {
     return parseOAuthResponse(json)
   }
 
-  private func loadAccessToken() throws -> String {
-    // Try Keychain first (macOS)
-    if let token = try? loadFromKeychain() {
-      return token
-    }
-
-    // Fallback to file
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    let credPath = home.appendingPathComponent(".claude/.credentials.json")
-
-    guard let data = try? Data(contentsOf: credPath),
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else {
-      throw FetchError.noCredentials
-    }
-
-    // Try new format: claudeAiOauth.accessToken
+  private func tokenFromJSON(_ json: [String: Any]) -> String? {
     if let oauth = json["claudeAiOauth"] as? [String: Any],
        let token = oauth["accessToken"] as? String {
       return token
     }
-
-    // Fallback: old format with access_token
-    if let token = json["access_token"] as? String {
-      return token
-    }
-
-    throw FetchError.invalidCredentials
+    return json["access_token"] as? String
   }
 
-  private func loadFromKeychain() throws -> String? {
-    var result: CFTypeRef?
-    let query: [String: Any] = [
-      kSecClass as String: kSecClassGenericPassword,
-      kSecAttrService as String: "Claude Code-credentials",
-      kSecMatchLimit as String: kSecMatchLimitOne,
-      kSecReturnData as String: true,
-    ]
+  private func loadAccessToken() throws -> String {
+    // Same as Python helper: Keychain (`security`) then ~/.claude/.credentials.json
+    // Both cases: parse OAuth JSON via tokenFromJSON (claudeAiOauth.accessToken / access_token)
+    if let token = loadTokenFromSecurityCLI() {
+      return token
+    }
+    if let token = loadTokenFromCredentialsFile() {
+      return token
+    }
+    throw FetchError.noCredentials
+  }
 
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
-    guard status == errSecSuccess,
-          let data = result as? Data,
-          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    else {
+  private func loadTokenFromSecurityCLI() -> String? {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    proc.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    let out = Pipe()
+    let err = Pipe()
+    proc.standardOutput = out
+    proc.standardError = err
+    do {
+      try proc.run()
+      proc.waitUntilExit()
+    } catch {
       return nil
     }
+    guard proc.terminationStatus == 0 else { return nil }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    guard let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          let jsonData = str.data(using: .utf8),
+          let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
+    else { return nil }
+    return tokenFromJSON(json)
+  }
 
-    // Try new format: claudeAiOauth.accessToken
-    if let oauth = json["claudeAiOauth"] as? [String: Any],
-       let token = oauth["accessToken"] as? String {
-      return token
-    }
-
-    // Fallback: old format with access_token
-    if let token = json["access_token"] as? String {
-      return token
-    }
-
-    return nil
+  private func loadTokenFromCredentialsFile() -> String? {
+    let credPath = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent(".claude/.credentials.json")
+    guard let data = try? Data(contentsOf: credPath),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    return tokenFromJSON(json)
   }
 
   private func parseOAuthResponse(_ json: [String: Any]) -> ClaudeQuota {
+    func parseReset(_ resetStr: String?) -> (Date?, String?) {
+      guard let resetStr else { return (nil, nil) }
+      let formatter = ISO8601DateFormatter()
+      formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+      if let date = formatter.date(from: resetStr) {
+        return (date, formatReset(date))
+      }
+      // Some timestamps omit fractional seconds
+      formatter.formatOptions = [.withInternetDateTime]
+      if let date = formatter.date(from: resetStr) {
+        return (date, formatReset(date))
+      }
+      return (nil, nil)
+    }
+
     func parseWindow(_ key: String) -> ClaudeQuota.Window? {
       guard let data = json[key] as? [String: Any] else { return nil }
 
       // API returns "utilization" as percentage (0-100)
       guard let utilization = (data["utilization"] as? NSNumber)?.doubleValue else { return nil }
 
-      let percentUsed = utilization
-      let percentRemaining = 100 - percentUsed
-
-      var resetAt: Date?
-      var resetText: String?
-      if let resetStr = data["resets_at"] as? String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: resetStr) {
-          resetAt = date
-          resetText = formatReset(date)
-        }
-      }
-
+      let (resetAt, resetText) = parseReset(data["resets_at"] as? String)
       return ClaudeQuota.Window(
-        percentUsed: percentUsed,
-        percentRemaining: percentRemaining,
+        percentUsed: utilization,
+        percentRemaining: 100 - utilization,
         resetAt: resetAt,
         resetText: resetText
       )
@@ -167,6 +174,34 @@ final class ClaudeOAuthFetcher {
     let weekly = parseWindow("seven_day")
     let weeklyOpus = parseWindow("seven_day_opus")
     let weeklySonnet = parseWindow("seven_day_sonnet")
+
+    var limits: [ClaudeQuota.Limit] = []
+    if let arr = json["limits"] as? [[String: Any]] {
+      for item in arr {
+        guard let kind = item["kind"] as? String,
+              let percent = (item["percent"] as? NSNumber)?.doubleValue
+        else { continue }
+
+        let (resetAt, resetText) = parseReset(item["resets_at"] as? String)
+        var modelName: String?
+        if let scope = item["scope"] as? [String: Any],
+           let model = scope["model"] as? [String: Any] {
+          modelName = model["display_name"] as? String
+        }
+
+        limits.append(ClaudeQuota.Limit(
+          kind: kind,
+          group: item["group"] as? String,
+          percentUsed: percent,
+          percentRemaining: 100 - percent,
+          severity: item["severity"] as? String,
+          resetAt: resetAt,
+          resetText: resetText,
+          modelName: modelName,
+          isActive: item["is_active"] as? Bool
+        ))
+      }
+    }
 
     var extraUsage: ClaudeQuota.ExtraUsage?
     if let extra = json["extra_usage"] as? [String: Any],
@@ -189,6 +224,7 @@ final class ClaudeOAuthFetcher {
       weekly: weekly,
       weeklyOpus: weeklyOpus,
       weeklySonnet: weeklySonnet,
+      limits: limits,
       accountEmail: nil,
       plan: nil,
       extraUsage: extraUsage
@@ -225,6 +261,28 @@ enum QuotaFormatter {
     let resetPart = window.resetText.map { " (resets in \($0))" } ?? ""
 
     return String(format: "\(label): %.1f%% \(percentLabel)\(resetPart)", percent)
+  }
+
+  static func label(for limit: ClaudeQuota.Limit) -> String {
+    if let model = limit.modelName {
+      return "Weekly \(model)"
+    }
+    switch limit.kind {
+    case "session": return "Session (5h)"
+    case "weekly_all": return "Weekly (7d)"
+    case "weekly_scoped": return "Weekly (scoped)"
+    default: return limit.kind
+    }
+  }
+
+  static func formatLimit(_ limit: ClaudeQuota.Limit, showUsed: Bool) -> String {
+    let percent = showUsed ? limit.percentUsed : limit.percentRemaining
+    let percentLabel = showUsed ? "used" : "remaining"
+    var suffix = limit.resetText.map { " (resets in \($0))" } ?? ""
+    if limit.isActive == true {
+      suffix += " [active]"
+    }
+    return String(format: "\(label(for: limit)): %.1f%% \(percentLabel)\(suffix)", percent)
   }
 
   static func formatProgressBar(percent: Double, width: Int = 40) -> String {
@@ -336,40 +394,53 @@ struct CLI {
 
     let showUsed = options.showUsed
 
-    if let session = quota.session {
-      print(QuotaFormatter.formatWindow(session, label: "Session (5h)", showUsed: showUsed))
-      if !options.noBars {
-        let percent = showUsed ? session.percentUsed : session.percentRemaining
-        print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+    // Prefer `limits` when present (covers Fable / scoped models etc.)
+    if !quota.limits.isEmpty {
+      for limit in quota.limits {
+        print(QuotaFormatter.formatLimit(limit, showUsed: showUsed))
+        if !options.noBars {
+          let percent = showUsed ? limit.percentUsed : limit.percentRemaining
+          print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+        }
+        print()
       }
-      print()
-    }
+    } else {
+      // Fallback to legacy top-level windows
+      if let session = quota.session {
+        print(QuotaFormatter.formatWindow(session, label: "Session (5h)", showUsed: showUsed))
+        if !options.noBars {
+          let percent = showUsed ? session.percentUsed : session.percentRemaining
+          print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+        }
+        print()
+      }
 
-    if let weekly = quota.weekly {
-      print(QuotaFormatter.formatWindow(weekly, label: "Weekly (7d)", showUsed: showUsed))
-      if !options.noBars {
-        let percent = showUsed ? weekly.percentUsed : weekly.percentRemaining
-        print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+      if let weekly = quota.weekly {
+        print(QuotaFormatter.formatWindow(weekly, label: "Weekly (7d)", showUsed: showUsed))
+        if !options.noBars {
+          let percent = showUsed ? weekly.percentUsed : weekly.percentRemaining
+          print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+        }
+        print()
       }
-      print()
-    }
 
-    if let opus = quota.weeklyOpus {
-      print(QuotaFormatter.formatWindow(opus, label: "Weekly Opus", showUsed: showUsed))
-      if !options.noBars {
-        let percent = showUsed ? opus.percentUsed : opus.percentRemaining
-        print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+      if let opus = quota.weeklyOpus {
+        print(QuotaFormatter.formatWindow(opus, label: "Weekly Opus", showUsed: showUsed))
+        if !options.noBars {
+          let percent = showUsed ? opus.percentUsed : opus.percentRemaining
+          print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+        }
+        print()
       }
-      print()
-    }
 
-    if let sonnet = quota.weeklySonnet {
-      print(QuotaFormatter.formatWindow(sonnet, label: "Weekly Sonnet", showUsed: showUsed))
-      if !options.noBars {
-        let percent = showUsed ? sonnet.percentUsed : sonnet.percentRemaining
-        print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+      if let sonnet = quota.weeklySonnet {
+        print(QuotaFormatter.formatWindow(sonnet, label: "Weekly Sonnet", showUsed: showUsed))
+        if !options.noBars {
+          let percent = showUsed ? sonnet.percentUsed : sonnet.percentRemaining
+          print("  \(QuotaFormatter.formatProgressBar(percent: percent))")
+        }
+        print()
       }
-      print()
     }
 
     if let extra = quota.extraUsage {
@@ -411,6 +482,24 @@ struct CLI {
     }
     if let sonnet = quota.weeklySonnet {
       output["weeklySonnet"] = windowDict(sonnet)
+    }
+    if !quota.limits.isEmpty {
+      output["limits"] = quota.limits.map { limit -> [String: Any] in
+        var dict: [String: Any] = [
+          "kind": limit.kind,
+          "percentUsed": limit.percentUsed,
+          "percentRemaining": limit.percentRemaining,
+        ]
+        if let group = limit.group { dict["group"] = group }
+        if let severity = limit.severity { dict["severity"] = severity }
+        if let resetAt = limit.resetAt {
+          dict["resetAt"] = ISO8601DateFormatter().string(from: resetAt)
+        }
+        if let resetText = limit.resetText { dict["resetText"] = resetText }
+        if let modelName = limit.modelName { dict["modelName"] = modelName }
+        if let isActive = limit.isActive { dict["isActive"] = isActive }
+        return dict
+      }
     }
     if let email = quota.accountEmail {
       output["accountEmail"] = email
